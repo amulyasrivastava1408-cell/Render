@@ -1,0 +1,227 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-canvas: var(--app-canvas);
+  --color-well: var(--app-well);
+  --color-ink: var(--app-ink);
+  --color-muted: var(--app-muted);
+  --color-marker: var(--app-marker);
+  --color-focus: var(--app-focus);
+  --color-surface: var(--app-surface);
+  --color-line: var(--app-line);
+  --color-action: var(--app-action);
+  --color-action-foreground: var(--app-action-foreground);
+  --color-action-hover: var(--app-action-hover);
+  --color-placeholder: var(--app-placeholder);
+  --color-control-rail: var(--app-control-rail);
+  --color-preview: var(--app-preview);
+  --font-sans: var(--font-inter), system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+:root {
+  color-scheme: light;
+  --app-canvas: #fafaf7;
+  --app-well: #efede8;
+  --app-ink: #2a2a27;
+  --app-muted: #6f6d68;
+  --app-marker: #ffe2a8;
+  --app-focus: #8b7cf6;
+  --app-surface: #ffffff;
+  --app-line: rgba(42, 42, 39, 0.08);
+  --app-action: #2a2a27;
+  --app-action-foreground: #ffffff;
+  --app-action-hover: #000000;
+  --app-placeholder: rgba(0, 0, 0, 0.25);
+  --app-control-rail: rgba(0, 0, 0, 0.15);
+  --app-preview: #f6f5f1;
+  --studio-shell: radial-gradient(ellipse 70% 80% at 0% 0%, #e6dcff 0%, transparent 60%), radial-gradient(ellipse 70% 80% at 100% 100%, #fbd9e8 0%, transparent 60%), #efebf7;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --app-canvas: #171715;
+  --app-well: #262522;
+  --app-ink: #f0efeb;
+  --app-muted: #aaa8a1;
+  --app-marker: #55452e;
+  --app-focus: #b4a8ff;
+  --app-surface: #201f1d;
+  --app-line: rgba(255, 255, 255, 0.1);
+  --app-action: #e8e6df;
+  --app-action-foreground: #22211f;
+  --app-action-hover: #cbc9c1;
+  --app-placeholder: rgba(255, 255, 255, 0.35);
+  --app-control-rail: rgba(255, 255, 255, 0.18);
+  --app-preview: #1c1b19;
+  --studio-shell: radial-gradient(ellipse 70% 80% at 0% 0%, #302841 0%, transparent 60%), radial-gradient(ellipse 70% 80% at 100% 100%, #3a2933 0%, transparent 60%), #211f24;
+}
+
+/* The built-in curves are too soft to feel intentional, so every transition uses these. */
+@theme {
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --default-transition-duration: 150ms;
+  --default-transition-timing-function: cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+body {
+  color: var(--color-ink);
+  background: var(--color-canvas);
+  font-family: var(--font-sans);
+  font-feature-settings: "cv11", "ss01";
+}
+
+::selection {
+  background: var(--color-marker);
+}
+
+/* Layered so utilities like outline-none can override it. */
+@layer base {
+  html {
+    min-height: 100%;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+}
+
+/* Pressable controls give slightly under the finger. Pair with a transition that names `scale`. */
+@utility press {
+  -webkit-tap-highlight-color: transparent;
+
+  @media (prefers-reduced-motion: no-preference) {
+    &:active:not(:disabled) {
+      scale: 0.96;
+    }
+  }
+}
+
+/* Marker-pen highlight for one phrase per paragraph. */
+.marker {
+  background: linear-gradient(transparent 12%, var(--color-marker) 12%, var(--color-marker) 92%, transparent 92%);
+  border-radius: 3px;
+  padding: 0 0.15em;
+  color: var(--color-ink);
+}
+
+/* A lightly flecked paper surface helps the editor preview recede behind the card. */
+.preview-surface {
+  background-color: var(--color-preview);
+  background-image:
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--color-ink) 7%, transparent) 0.65px, transparent 0.8px),
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--color-surface) 80%, transparent) 0.65px, transparent 0.8px),
+    linear-gradient(135deg, color-mix(in srgb, var(--color-surface) 38%, transparent), transparent 65%);
+  background-position: 0 0, 6px 8px, 0 0;
+  background-size: 13px 13px, 17px 17px, auto;
+}
+
+.theme-icon-light {
+  display: block;
+}
+
+.theme-icon-dark {
+  display: none;
+}
+
+html[data-theme="dark"] .theme-icon-light {
+  display: none;
+}
+
+html[data-theme="dark"] .theme-icon-dark {
+  display: block;
+}
+
+/*
+ * Entrances keep their hidden state in the `from` keyframe, so nothing is left invisible if an
+ * animation never runs. Everyone gets the opacity fade; movement and blur join it only without
+ * the reduced-motion preference.
+ */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+    filter: blur(4px);
+  }
+}
+
+/* Phones: skip the blur, which is costly to animate on large sections. */
+@keyframes fade-in-up-light {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+}
+
+/* A newly generated card settles onto the canvas. */
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.97);
+  }
+}
+
+/* The hint cursor drifts toward the handle input, like someone about to click it. */
+@keyframes cursor-nudge {
+  0%,
+  100% {
+    transform: translate(5px, 6px);
+  }
+  50% {
+    transform: translate(0, 0);
+  }
+}
+
+.card-in {
+  animation: fade-in 300ms var(--ease-out) both;
+}
+
+/* Sections fade in the first time they're scrolled to. */
+.reveal.is-visible {
+  animation: fade-in 300ms var(--ease-out) both;
+}
+
+/* Only hide what script will reveal, so the page still reads with JavaScript off. */
+@media (scripting: enabled) {
+  .reveal:not(.is-visible) {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .card-in {
+    animation-name: card-in;
+  }
+
+  .reveal.is-visible {
+    animation-name: fade-in-up;
+  }
+
+  .cursor-nudge {
+    animation: cursor-nudge 2.4s var(--ease-in-out) infinite;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) and (max-width: 639px) {
+  .reveal.is-visible {
+    animation-name: fade-in-up-light;
+  }
+}

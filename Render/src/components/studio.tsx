@@ -1,0 +1,860 @@
+"use client";
+
+import clsx from "clsx";
+import { toBlob, toPng } from "html-to-image";
+import { Check, ChevronDown, Copy, Download, ImagePlus, Loader2, RotateCcw, Share2 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { BACKDROPS, backdropStyle, DEFAULT_BACKDROP, type Backdrop } from "@/lib/backdrops";
+import {
+  blankProfile,
+  normalizeHandle,
+  PLATFORM_ORDER,
+  PLATFORMS,
+  type PlatformId,
+  type Profile,
+} from "@/lib/platforms";
+import { PLATFORM_ICONS } from "./brand-icons";
+import { Reveal } from "./reveal";
+import { DEFAULT_FORMAT, EXPORT_SCALE, FORMATS, getFormat } from "@/lib/formats";
+import { cardWidth, ProfileCard, type CardOptions, type CardShape, type CardSize, type CardStyle } from "./profile-card";
+
+type BackdropChoice = Backdrop | { upload: string };
+
+// Shown before anyone generates a card, so the studio is never empty.
+const SAMPLE: Profile = {
+  ...blankProfile("x", "ada"),
+  name: "Ada Lovelace",
+  bio: "Writing the first program. Mostly notes on the Analytical Engine.",
+  verified: true,
+  stats: [
+    { key: "followers", label: "followers", value: 18_420 },
+    { key: "following", label: "following", value: 212 },
+    { key: "posts", label: "posts", value: 1_318 },
+  ],
+};
+
+const STYLES: { id: CardStyle; label: string }[] = [
+  { id: "native", label: "Native" },
+  { id: "minimal", label: "Minimal" },
+  { id: "ticket", label: "Ticket" },
+];
+
+function defaultOptions(platform: PlatformId, style: CardStyle = "native"): CardOptions {
+  const config = PLATFORMS[platform];
+  return {
+    style,
+    shape: "square",
+    size: "M",
+    theme: "light",
+    visibleStats: config.defaultVisible,
+    showVerified: true,
+    showBanner: config.hasBanner,
+    showPlatformMark: false,
+  };
+}
+
+function readFile(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+function capitalize(text: string) {
+  return text[0].toUpperCase() + text.slice(1);
+}
+
+// File inputs are visually hidden inside their label, so the label shows the keyboard focus ring.
+const FILE_FOCUS =
+  "has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-focus";
+
+export function Studio({
+  initialProfile,
+}: {
+  initialProfile?: { platform: PlatformId; handle: string; profile: Profile; error?: string };
+}) {
+  const [platform, setPlatform] = useState<PlatformId>(initialProfile?.platform ?? "x");
+  const [input, setInput] = useState(initialProfile?.handle ?? "");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(initialProfile?.error ?? null);
+  const [profile, setProfile] = useState<Profile>(initialProfile?.profile ?? SAMPLE);
+  const [generation, setGeneration] = useState(0);
+  const [options, setOptions] = useState<CardOptions>(() => defaultOptions(initialProfile?.platform ?? "x"));
+  const [backdrop, setBackdrop] = useState<BackdropChoice>(DEFAULT_BACKDROP);
+  const [exportState, setExportState] = useState<
+    "idle" | "copying" | "copied" | "saving" | "saved" | "sharing" | "shared" | "linkCopied"
+  >("idle");
+  const [formatId, setFormatId] = useState(DEFAULT_FORMAT[initialProfile?.platform ?? "x"]);
+  const [previewBox, setPreviewBox] = useState({ width: 0, height: 0 });
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const studioRef = useRef<HTMLElement>(null);
+  const exportResetRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const scrollPending = useRef(false);
+
+  useEffect(() => () => clearTimeout(exportResetRef.current), []);
+
+  const format = getFormat(formatId);
+  // Fit the full-size frame inside the preview area, whichever side is tighter.
+  const previewScale = previewBox.width
+    ? Math.min(previewBox.width / format.width, previewBox.height / format.height)
+    : 0;
+
+  // The frame renders at its real export size; scale it down to fit the preview column.
+  useEffect(() => {
+    const el = previewRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver(([entry]) =>
+      setPreviewBox({ width: entry.contentRect.width, height: entry.contentRect.height }),
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const config = PLATFORMS[platform];
+  const cardConfig = PLATFORMS[profile.platform];
+  // Hidden spinners stop, so nothing animates off-screen while the studio is idle.
+  const spinning = exportState !== "idle";
+
+  const showProfile = useCallback((next: Profile) => {
+    setProfile(next);
+    setOptions((o) => defaultOptions(next.platform, o.style));
+    setFormatId(DEFAULT_FORMAT[next.platform]);
+    setGeneration((g) => g + 1);
+  }, []);
+
+  useEffect(() => {
+    if (!initialProfile) return;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    studioRef.current?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
+  }, [initialProfile]);
+
+  // Bring the studio into view once a freshly generated card has rendered.
+  useEffect(() => {
+    if (!scrollPending.current) return;
+    scrollPending.current = false;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    studioRef.current?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
+  }, [generation]);
+
+  const scrollToStudio = useCallback(() => {
+    scrollPending.current = true;
+  }, []);
+
+  const loadProfile = useCallback(async (selectedPlatform: PlatformId, handle: string) => {
+    setError(null);
+
+    if (!PLATFORMS[selectedPlatform].fetchable) {
+      showProfile(blankProfile(selectedPlatform, handle));
+      scrollToStudio();
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/profile/${selectedPlatform}/${encodeURIComponent(handle)}`);
+      const data = await res.json();
+      // Instagram often hides profile data; fall back to a card the user fills in.
+      if (!res.ok && selectedPlatform === "instagram" && res.status !== 400) {
+        showProfile(blankProfile(selectedPlatform, handle));
+        scrollToStudio();
+        setError(data.error ?? "Couldn't read that Instagram profile, so fill in the details yourself.");
+        return;
+      }
+      if (!res.ok) throw new Error(data.error ?? "Something went wrong.");
+      showProfile(data as Profile);
+      scrollToStudio();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Something went wrong.");
+    } finally {
+      setLoading(false);
+    }
+  }, [scrollToStudio, showProfile]);
+
+  async function generate(event: React.FormEvent) {
+    event.preventDefault();
+    const handle = normalizeHandle(input);
+    if (!handle) return;
+    await loadProfile(platform, handle);
+  }
+
+  function updateProfile(patch: Partial<Profile>) {
+    setProfile((p) => ({ ...p, ...patch }));
+  }
+
+  function updateStat(key: string, value: number) {
+    setProfile((p) => ({ ...p, stats: p.stats.map((s) => (s.key === key ? { ...s, value } : s)) }));
+  }
+
+  async function exportImage(mode: "copy" | "download") {
+    const node = canvasRef.current;
+    if (!node) return;
+    const opts = { pixelRatio: EXPORT_SCALE, cacheBust: true, width: format.width, height: format.height };
+    // A second export must not be cut short by the first one's pending reset.
+    clearTimeout(exportResetRef.current);
+    try {
+      if (mode === "copy") {
+        setExportState("copying");
+        // Pass a promise so Safari keeps the user-gesture context while rendering.
+        const blob = toBlob(node, opts).then((b) => {
+          if (!b) throw new Error("Render failed");
+          return b;
+        });
+        await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+        setExportState("copied");
+      } else {
+        setExportState("saving");
+        const url = await toPng(node, opts);
+        const link = document.createElement("a");
+        link.download = `render-${profile.handle}-${format.id}.png`;
+        link.href = url;
+        link.click();
+        setExportState("saved");
+      }
+    } catch {
+      setError(
+        mode === "copy"
+          ? "Your browser blocked copying the image. Use Download instead."
+          : "The image couldn't be rendered. Try a different background image.",
+      );
+      setExportState("idle");
+      return;
+    }
+    exportResetRef.current = setTimeout(() => setExportState("idle"), 1800);
+  }
+
+  async function shareProfile() {
+    const url = new URL(`/${profile.platform}/${encodeURIComponent(profile.handle)}`, window.location.origin).toString();
+    clearTimeout(exportResetRef.current);
+    setExportState("sharing");
+
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: `${profile.name} on ${PLATFORMS[profile.platform].label}`, url });
+        setExportState("shared");
+      } else {
+        await navigator.clipboard.writeText(url);
+        setExportState("linkCopied");
+      }
+      exportResetRef.current = setTimeout(() => setExportState("idle"), 1800);
+    } catch (e) {
+      setExportState("idle");
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      setError("Couldn't share the profile link. Copy the URL from your browser instead.");
+    }
+  }
+
+  return (
+    <>
+      <section className="mx-auto flex w-full max-w-3xl flex-col items-center px-4 pt-14 text-center sm:pt-20">
+        {/* Above the fold, so the entrance plays on first paint, staggered 50ms per chunk. */}
+        <Reveal immediate>
+          <h1 className="text-[40px] leading-[1.05] font-medium tracking-[-0.035em] text-balance sm:text-[60px]">
+            Your profile, as a card worth posting.
+          </h1>
+        </Reveal>
+        <Reveal immediate delay={50}>
+          <p className="mt-5 max-w-xl text-lg leading-relaxed tracking-[-0.015em] text-muted sm:text-xl">
+            Render turns an X, GitHub or Instagram handle into a <span className="marker whitespace-nowrap">share-ready card</span> in
+            seconds. No sign-up, no design tool.
+          </p>
+        </Reveal>
+
+        <Reveal immediate delay={100} className="w-full max-w-md sm:w-auto sm:max-w-none">
+          {/* Four equal tabs on phones so they never wrap; a single pill row from sm up. */}
+          <div className="relative mt-9 grid w-full grid-cols-4 rounded-[20px] bg-well p-1 sm:w-[440px] sm:rounded-full">
+            <span
+              aria-hidden
+              className="pointer-events-none absolute top-1 bottom-1 left-1 rounded-2xl bg-surface shadow-[0_1px_2px_rgba(42,42,39,.12)] transition-transform duration-200 ease-in-out motion-reduce:transition-none sm:rounded-full"
+              style={{
+                width: "calc((100% - 8px) / 4)",
+                transform: `translateX(${PLATFORM_ORDER.indexOf(platform) * 100}%)`,
+              }}
+            />
+            {PLATFORM_ORDER.map((id) => {
+              const Icon = PLATFORM_ICONS[id];
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => {
+                    setPlatform(id);
+                    setError(null);
+                  }}
+                  aria-pressed={platform === id}
+                  className={clsx(
+                    "relative z-10 flex flex-col items-center justify-center gap-1 rounded-2xl px-1 py-2 text-[12px] transition-[color] sm:flex-row sm:gap-2 sm:rounded-full sm:px-4 sm:text-sm",
+                    platform === id
+                      ? "font-medium text-ink"
+                      : "text-muted hover:text-ink",
+                  )}
+                >
+                  <Icon className="h-3.5 w-3.5 shrink-0" />
+                  {PLATFORMS[id].label}
+                </button>
+              );
+            })}
+          </div>
+        </Reveal>
+
+        <Reveal immediate delay={150} className="w-full max-w-md">
+          {/* The transparent border keeps an edge in forced-colors mode, which drops the ring. */}
+          <form
+            onSubmit={generate}
+            className="group relative mt-3 flex w-full max-w-md items-center gap-2 rounded-full border border-transparent bg-surface py-1.5 pr-1.5 pl-4 shadow-[0_1px_2px_rgba(42,42,39,.08),0_8px_24px_-12px_rgba(42,42,39,.25)] ring-1 ring-line transition-[box-shadow] focus-within:ring-focus sm:pl-5"
+          >
+            <span className="shrink-0 text-[14px] text-muted/70 sm:text-[15px]">{config.prefix}</span>
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder={config.placeholder}
+              aria-label={`${config.label} handle`}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              className="min-w-0 flex-1 bg-transparent text-base font-medium sm:text-[15px] outline-none focus-visible:outline-none placeholder:font-normal placeholder:text-placeholder"
+            />
+            {/* The spinner cross-fades over the label instead of widening the button. */}
+            <button
+              type="submit"
+              disabled={loading || !input.trim()}
+              aria-busy={loading}
+              className="press grid shrink-0 place-items-center rounded-full bg-action px-4 py-2.5 text-sm font-medium text-action-foreground transition-[background-color,opacity,scale] hover:bg-action-hover disabled:opacity-35 sm:px-5"
+            >
+              <span className={clsx("[grid-area:1/1] transition-opacity", loading && "opacity-0")}>Make card</span>
+              <span aria-hidden className={clsx("[grid-area:1/1] transition-opacity", !loading && "opacity-0")}>
+                <Loader2 className={clsx("h-4 w-4", loading && "animate-spin")} strokeWidth={2} absoluteStrokeWidth />
+              </span>
+            </button>
+
+            {/* Collaborator-style cursor pointing at the input; leaves faster than it returns. */}
+            <div
+              aria-hidden
+              className={clsx(
+                "pointer-events-none absolute top-[54%] left-[31%] hidden transition-opacity group-focus-within:opacity-0 group-focus-within:duration-150 sm:block",
+                input ? "opacity-0 duration-150" : "duration-300",
+              )}
+            >
+              <div className="cursor-nudge flex items-start">
+                <svg viewBox="0 0 20 22" className="h-[22px] w-5 drop-shadow-[0_2px_4px_rgba(60,40,140,.35)]">
+                  <path
+                    d="M2 2 L2 18 L6.5 13.8 L9.6 20.2 L12.4 18.9 L9.4 12.6 L15.6 12.4 Z"
+                    fill="#7c5cff"
+                    stroke="#fff"
+                    strokeWidth="1.6"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+                <span className="mt-4 -ml-1 rounded-full rounded-tl-sm bg-[#7c5cff] px-2.5 py-1 text-xs font-medium whitespace-nowrap text-white shadow-[0_4px_12px_-4px_rgba(60,40,140,.5)]">
+                  Your {config.label} handle goes here
+                </span>
+              </div>
+            </div>
+          </form>
+        </Reveal>
+
+        <Reveal immediate delay={200}>
+          <p aria-live="polite" className={clsx("mt-5 min-h-5 text-sm", error ? "text-red-600" : "text-muted")}>
+            {error ??
+              (config.fetchable
+                ? `We pull your public ${config.label} profile. Nothing is stored.`
+                : `${config.label} keeps profiles private, so you'll fill in the numbers yourself.`)}
+          </p>
+        </Reveal>
+      </section>
+
+      <section ref={studioRef} id="studio" className="mx-auto mt-10 w-full max-w-7xl scroll-mt-4 px-2 sm:px-4">
+        <h2 className="sr-only">Card studio</h2>
+        <Reveal>
+          {/* Outer radius = window radius (16) + padding (8) on phones; from sm the padding passes 24px and the two read as separate surfaces. */}
+          <div
+            className="rounded-3xl p-2 sm:rounded-[28px] sm:p-7 lg:p-8"
+            style={{
+              background: "var(--studio-shell)",
+            }}
+          >
+            <div className="overflow-clip rounded-2xl border border-transparent bg-surface shadow-[0_1px_2px_rgba(42,42,39,.06),0_30px_60px_-30px_rgba(60,40,120,.35)] ring-1 ring-line">
+              <div className="flex items-center gap-3 border-b border-line px-4 py-3">
+                <div className="flex gap-1.5" aria-hidden>
+                  <span className="h-3 w-3 rounded-full bg-[#ff5f57]" />
+                  <span className="h-3 w-3 rounded-full bg-[#febc2e]" />
+                  <span className="h-3 w-3 rounded-full bg-[#28c840]" />
+                </div>
+                <span className="flex-1 truncate text-center font-mono text-xs text-muted">
+                  render-{profile.handle}-{format.id}.png · {format.width * EXPORT_SCALE}×{format.height * EXPORT_SCALE}
+                </span>
+                <button
+                  type="button"
+                  onClick={shareProfile}
+                  disabled={exportState === "sharing"}
+                  className="press flex shrink-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-muted transition-[color,scale] hover:text-ink disabled:opacity-50"
+                >
+                  <IconSwap
+                    active={exportState === "sharing" ? "busy" : exportState === "shared" || exportState === "linkCopied" ? "done" : "idle"}
+                    icons={{
+                      idle: <Share2 className="h-3.5 w-3.5" strokeWidth={1.5} absoluteStrokeWidth />,
+                      busy: <Loader2 className={clsx("h-3.5 w-3.5", spinning && "animate-spin")} strokeWidth={1.5} absoluteStrokeWidth />,
+                      done: <Check className="h-3.5 w-3.5 text-emerald-600" strokeWidth={1.5} absoluteStrokeWidth />,
+                    }}
+                  />
+                  <span className="text-xs font-medium">
+                    {exportState === "sharing"
+                      ? "Sharing"
+                      : exportState === "shared"
+                        ? "Shared"
+                        : exportState === "linkCopied"
+                          ? "Copied"
+                          : "Share"}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  title="Back to the sample card"
+                  aria-label="Back to the sample card"
+                  onClick={() => {
+                    showProfile(SAMPLE);
+                    setInput("");
+                  }}
+                  className="press -m-1.5 rounded-md p-1.5 text-muted transition-[color,scale] hover:text-ink"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" strokeWidth={1.5} absoluteStrokeWidth />
+                </button>
+              </div>
+
+              {/* Fixed-height body on desktop: the inspector scrolls on its own instead of stretching the window.
+                  Stacked below lg, where the preview sticks to the top so every tweak stays in view. */}
+              <div className="flex flex-col lg:grid lg:h-[min(660px,calc(100svh-120px))] lg:grid-cols-[1fr_320px]">
+                <div className="preview-surface sticky top-0 z-20 flex h-[250px] border-b border-line p-4 sm:h-[400px] sm:p-6 lg:static lg:h-full lg:border-b-0 lg:p-8">
+                  <div ref={previewRef} className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
+                    {/* Outlined like an image: an inset hairline that never changes the frame's size. */}
+                    <div
+                      className="relative shrink-0 overflow-hidden rounded-xl outline-1 -outline-offset-1 outline-line"
+                      style={{
+                        width: format.width * previewScale,
+                        height: format.height * previewScale,
+                        visibility: previewScale ? "visible" : "hidden",
+                      }}
+                    >
+                      <div
+                        className="absolute top-0 left-0 origin-top-left"
+                        style={{ transform: `scale(${previewScale})` }}
+                      >
+                        <div
+                          ref={canvasRef}
+                          className="flex items-center justify-center"
+                          style={{ width: format.width, height: format.height, ...backdropStyle(backdrop) }}
+                        >
+                          {/* Only freshly generated cards settle in; the sample shows without a second entrance. */}
+                          <div key={generation} className={clsx(generation > 0 && "card-in")}>
+                            <ProfileCard profile={profile} options={options} width={cardWidth(options.size, format)} />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <aside className="flex min-h-0 flex-col text-sm lg:border-l lg:border-line">
+                  {/* Its own scroll box only on desktop: on phones an empty overflow box with overscroll-contain swallows page swipes. */}
+                  <div className="divide-y divide-line lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:overscroll-contain">
+                    <InspectorSection title="Style">
+                      <Segmented
+                        value={options.style}
+                        values={STYLES.map((s) => s.id)}
+                        labels={Object.fromEntries(STYLES.map((s) => [s.id, s.label]))}
+                        onChange={(style) => setOptions((o) => ({ ...o, style }))}
+                      />
+                    </InspectorSection>
+
+                    <InspectorSection title="Format">
+                      <div className="flex flex-col gap-0.5">
+                        {FORMATS.map((f) => (
+                          <button
+                            key={f.id}
+                            type="button"
+                            aria-pressed={f.id === format.id}
+                            onClick={() => setFormatId(f.id)}
+                            className={clsx(
+                              "flex items-center gap-3 rounded-lg px-2 py-2 text-left transition-[color,background-color] lg:py-1.5",
+                              f.id === format.id ? "bg-well text-ink" : "text-muted hover:text-ink",
+                            )}
+                          >
+                            <span aria-hidden className="flex h-5 w-5 shrink-0 items-center justify-center">
+                              <span
+                                className={clsx(
+                                  "block rounded-[2px] border-[1.5px]",
+                                  f.id === format.id ? "border-ink" : "border-current",
+                                )}
+                                style={
+                                  f.width >= f.height
+                                    ? { width: 18, height: Math.round((18 * f.height) / f.width) }
+                                    : { height: 18, width: Math.round((18 * f.width) / f.height) }
+                                }
+                              />
+                            </span>
+                            <span className="flex-1">{f.label}</span>
+                            <span className="font-mono text-xs text-muted">{f.ratio}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </InspectorSection>
+
+                    <InspectorSection title="Background">
+                      <div className="grid grid-cols-8 gap-1.5 lg:grid-cols-4">
+                        {BACKDROPS.map((b) => (
+                          <button
+                            key={b.id}
+                            type="button"
+                            title={b.label}
+                            aria-label={`${b.label} background`}
+                            aria-pressed={"id" in backdrop && backdrop.id === b.id}
+                            onClick={() => setBackdrop(b)}
+                            className={clsx(
+                              "press aspect-square rounded-lg ring-offset-2 ring-offset-surface transition-[box-shadow,scale]",
+                              "id" in backdrop && backdrop.id === b.id
+                                ? "ring-2 ring-ink"
+                                : "ring-1 ring-line hover:ring-muted",
+                            )}
+                            style={backdropStyle(b)}
+                          />
+                        ))}
+                        <label
+                          title="Upload your own"
+                          className={clsx(
+                            "press flex aspect-square cursor-pointer items-center justify-center rounded-lg text-muted ring-offset-2 ring-offset-surface transition-[color,box-shadow,scale] hover:text-ink",
+                            FILE_FOCUS,
+                            "upload" in backdrop ? "ring-2 ring-ink" : "border border-dashed border-line",
+                          )}
+                        >
+                          <ImagePlus className="h-4 w-4" strokeWidth={1.5} absoluteStrokeWidth />
+                          <span className="sr-only">Upload a background image</span>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="sr-only"
+                            onChange={async (e) => {
+                              const file = e.target.files?.[0];
+                              // Clear the value so picking the same file again still fires.
+                              e.target.value = "";
+                              if (file) setBackdrop({ upload: await readFile(file) });
+                            }}
+                          />
+                        </label>
+                      </div>
+                    </InspectorSection>
+
+                    <InspectorSection title="Layout">
+                      <div className="grid grid-cols-2 gap-2">
+                        <Segmented
+                          value={options.size}
+                          values={["S", "M", "L"] as CardSize[]}
+                          onChange={(size) => setOptions((o) => ({ ...o, size }))}
+                        />
+                        <Segmented
+                          value={options.theme}
+                          values={["light", "dark"] as const}
+                          labels={{ light: "Light", dark: "Dark" }}
+                          onChange={(theme) => setOptions((o) => ({ ...o, theme }))}
+                        />
+                      </div>
+                      {options.style !== "ticket" && (
+                        <Segmented
+                          value={options.shape}
+                          values={["square", "rectangle"] as CardShape[]}
+                          labels={{ square: "Square", rectangle: "Rectangle" }}
+                          onChange={(shape) => setOptions((o) => ({ ...o, shape }))}
+                        />
+                      )}
+                    </InspectorSection>
+
+                    <InspectorSection title="Show">
+                      <div className="flex flex-col gap-0.5">
+                        {profile.stats.map((s) => (
+                          <Switch
+                            key={s.key}
+                            label={capitalize(s.label)}
+                            checked={options.visibleStats.includes(s.key)}
+                            onChange={(on) =>
+                              setOptions((o) => ({
+                                ...o,
+                                visibleStats: on
+                                  ? [...o.visibleStats, s.key]
+                                  : o.visibleStats.filter((k) => k !== s.key),
+                              }))
+                            }
+                          />
+                        ))}
+                        <Switch
+                          label="Verified badge"
+                          checked={options.showVerified}
+                          onChange={(showVerified) => setOptions((o) => ({ ...o, showVerified }))}
+                        />
+                        {cardConfig.hasBanner && options.style === "native" && (
+                          <Switch
+                            label="Banner"
+                            checked={options.showBanner}
+                            onChange={(showBanner) => setOptions((o) => ({ ...o, showBanner }))}
+                          />
+                        )}
+                        <Switch
+                          label={`${cardConfig.label} logo`}
+                          checked={options.showPlatformMark}
+                          onChange={(showPlatformMark) => setOptions((o) => ({ ...o, showPlatformMark }))}
+                        />
+                      </div>
+                    </InspectorSection>
+
+                    <details className="group" open={!cardConfig.fetchable}>
+                      <summary className="flex cursor-pointer list-none items-center justify-between px-5 py-4 font-medium [&::-webkit-details-marker]:hidden">
+                        Edit details
+                        <ChevronDown
+                          className="h-4 w-4 text-muted transition-[rotate] duration-200 ease-in-out group-open:rotate-180 motion-reduce:transition-none"
+                          strokeWidth={2}
+                          absoluteStrokeWidth
+                        />
+                      </summary>
+                      <div className="flex flex-col gap-3 px-5 pb-5">
+                        <Field label="Name" value={profile.name} onChange={(name) => updateProfile({ name })} />
+                        <Field
+                          label={profile.platform === "linkedin" ? "Headline" : "Bio"}
+                          value={profile.bio}
+                          multiline
+                          onChange={(bio) => updateProfile({ bio })}
+                        />
+                        <div className="grid grid-cols-3 gap-2">
+                          {profile.stats.map((s) => (
+                            <Field
+                              key={s.key}
+                              label={capitalize(s.label)}
+                              type="number"
+                              value={String(s.value)}
+                              onChange={(v) => updateStat(s.key, Math.max(0, Number(v) || 0))}
+                            />
+                          ))}
+                        </div>
+                        <div className="flex gap-2">
+                          <ImageInput label="Photo" onChange={(avatarUrl) => updateProfile({ avatarUrl })} />
+                          {cardConfig.hasBanner && (
+                            <ImageInput label="Banner" onChange={(bannerUrl) => updateProfile({ bannerUrl })} />
+                          )}
+                        </div>
+                        <Switch
+                          label="Account is verified"
+                          checked={profile.verified}
+                          onChange={(verified) => updateProfile({ verified })}
+                        />
+                      </div>
+                    </details>
+                  </div>
+
+                  <div className="sticky bottom-0 z-10 flex gap-2 border-t border-line bg-surface p-4 pb-[max(1rem,env(safe-area-inset-bottom))] lg:static">
+                    <button
+                      type="button"
+                      onClick={() => exportImage("download")}
+                      className="press flex flex-1 items-center justify-center gap-2 rounded-full border border-transparent bg-action px-4 py-2.5 font-medium text-action-foreground transition-[background-color,scale] hover:bg-action-hover"
+                    >
+                      <IconSwap
+                        active={exportState === "saving" ? "busy" : exportState === "saved" ? "done" : "idle"}
+                        icons={{
+                          idle: <Download className="h-4 w-4" strokeWidth={2} absoluteStrokeWidth />,
+                          busy: <Loader2 className={clsx("h-4 w-4", spinning && "animate-spin")} strokeWidth={2} absoluteStrokeWidth />,
+                          done: <Check className="h-4 w-4" strokeWidth={2} absoluteStrokeWidth />,
+                        }}
+                      />
+                      {exportState === "saved" ? "Downloaded" : "Download"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => exportImage("copy")}
+                      className="press flex flex-1 items-center justify-center gap-2 rounded-full border border-line bg-surface px-4 py-2.5 font-medium transition-[background-color,scale] hover:bg-well"
+                    >
+                      <IconSwap
+                        active={exportState === "copying" ? "busy" : exportState === "copied" ? "done" : "idle"}
+                        icons={{
+                          idle: <Copy className="h-4 w-4" strokeWidth={2} absoluteStrokeWidth />,
+                          busy: <Loader2 className={clsx("h-4 w-4", spinning && "animate-spin")} strokeWidth={2} absoluteStrokeWidth />,
+                          done: <Check className="h-4 w-4 text-emerald-600" strokeWidth={2} absoluteStrokeWidth />,
+                        }}
+                      />
+                      {exportState === "copied" ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                </aside>
+              </div>
+            </div>
+          </div>
+
+        </Reveal>
+
+        <Reveal delay={50}>
+          <div className="mt-4 flex items-start justify-center gap-2 text-sm text-muted">
+            <svg viewBox="0 0 40 28" className="mt-[-6px] h-7 w-10 shrink-0" fill="none" aria-hidden>
+              <path
+                d="M36 24C24 25 12 20 7 6m0 0L3 12m4-6 6 3"
+                stroke="currentColor"
+                strokeWidth="1.4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            <span>Sized to show uncropped in the feed, exported at 2× for sharp text.</span>
+          </div>
+        </Reveal>
+      </section>
+    </>
+  );
+}
+
+function InspectorSection({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-3 px-5 py-4">
+      <h3 className="font-medium">{title}</h3>
+      {children}
+    </div>
+  );
+}
+
+/** Cross-fades stacked icons on an infrequent state change, so the swap never resizes the button. */
+function IconSwap({ active, icons }: { active: string; icons: Record<string, React.ReactNode> }) {
+  return (
+    <span aria-hidden className="grid place-items-center">
+      {Object.entries(icons).map(([key, icon]) => (
+        <span
+          key={key}
+          className={clsx(
+            "[grid-area:1/1] transition-[opacity,filter,scale] duration-300 ease-[cubic-bezier(0.2,0,0,1)]",
+            "motion-reduce:scale-100 motion-reduce:blur-[0px]",
+            key === active ? "scale-100 opacity-100 blur-[0px]" : "scale-[0.25] opacity-0 blur-[4px]",
+          )}
+        >
+          {icon}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function Segmented<T extends string>({
+  value,
+  values,
+  labels,
+  onChange,
+}: {
+  value: T;
+  values: readonly T[];
+  labels?: Partial<Record<T, string>>;
+  onChange: (value: T) => void;
+}) {
+  const selectedIndex = values.indexOf(value);
+  return (
+    <div
+      className="relative grid rounded-full bg-well p-0.5"
+      style={{ gridTemplateColumns: `repeat(${values.length}, minmax(0, 1fr))` }}
+    >
+      <span
+        aria-hidden
+        className="pointer-events-none absolute top-0.5 bottom-0.5 left-0.5 rounded-full bg-surface shadow-[0_1px_2px_rgba(42,42,39,.14)] transition-transform duration-200 ease-in-out motion-reduce:transition-none"
+        style={{
+          width: `calc((100% - 4px) / ${values.length})`,
+          transform: `translateX(${selectedIndex * 100}%)`,
+        }}
+      />
+      {values.map((v) => (
+        <button
+          key={v}
+          type="button"
+          aria-pressed={value === v}
+          onClick={() => onChange(v)}
+          className={clsx(
+            "relative z-10 rounded-full px-2 py-2 text-[13px] transition-[color] lg:py-1.5",
+            value === v ? "font-medium text-ink" : "text-muted hover:text-ink",
+          )}
+        >
+          {labels?.[v] ?? v}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Switch({ label, checked, onChange }: { label: string; checked: boolean; onChange: (on: boolean) => void }) {
+  return (
+    <label className="relative flex cursor-pointer items-center justify-between py-1.5">
+      <span className={checked ? "text-ink" : "text-muted"}>{label}</span>
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="peer sr-only" />
+      <span
+        aria-hidden
+        className={clsx(
+          "relative h-5 w-9 rounded-full transition-[background-color] peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-focus",
+          checked ? "bg-action" : "bg-control-rail",
+        )}
+      >
+        {/* Slides with translate rather than `left`, so the toggle never triggers layout. */}
+        <span
+          className={clsx(
+            "absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-surface shadow transition-[translate] duration-200 ease-in-out motion-reduce:transition-none",
+            checked && "translate-x-4",
+          )}
+        />
+      </span>
+    </label>
+  );
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  multiline,
+  type = "text",
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  multiline?: boolean;
+  type?: "text" | "number";
+}) {
+  const className =
+    "w-full rounded-lg border border-line bg-surface px-3 py-2 text-base outline-none transition-[box-shadow] focus:ring-2 focus:ring-focus/60 sm:text-sm";
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className="text-xs text-muted">{label}</span>
+      {multiline ? (
+        <textarea
+          rows={3}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className={clsx(className, "resize-none")}
+        />
+      ) : (
+        <input type={type} min={0} value={value} onChange={(e) => onChange(e.target.value)} className={className} />
+      )}
+    </label>
+  );
+}
+
+function ImageInput({ label, onChange }: { label: string; onChange: (dataUrl: string) => void }) {
+  return (
+    <label
+      className={clsx(
+        "press flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-full border border-line py-2 text-[13px] transition-[background-color,scale] hover:bg-well",
+        FILE_FOCUS,
+      )}
+    >
+      <ImagePlus className="h-3.5 w-3.5" strokeWidth={1.5} absoluteStrokeWidth />
+      Upload {label.toLowerCase()}
+      <input
+        type="file"
+        accept="image/*"
+        className="sr-only"
+        onChange={async (e) => {
+          const file = e.target.files?.[0];
+          e.target.value = "";
+          if (file) onChange(await readFile(file));
+        }}
+      />
+    </label>
+  );
+}
