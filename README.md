@@ -44,7 +44,7 @@ Render turns a public profile into a ready-to-post image. Choose a card style, l
 ### Run locally
 
 ```sh
-git clone https://github.com/abinash2553J/Render.git
+git clone https://github.com/amulyasrivastava1408-cell/Render.git
 pnpm install
 pnpm dev
 ```
